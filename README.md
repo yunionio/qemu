@@ -4,13 +4,22 @@
 
 ``` bash
 # clone 官方qemu代码
-$ git clone -b stable-2.12 https://gitlab.com/qemu-project/qemu.git
+$ git clone -b stable-4.2 https://gitlab.com/qemu-project/qemu.git
 
-# 下载2.12 patch 文件
-$ wget https://raw.githubusercontent.com/yunionio/qemu/stable-2.12/0001-patch-for-2.12.patch
+# 下载4.2 patch 文件
+$ wget https://raw.githubusercontent.com/yunionio/qemu/stable-4.2/0001-patch-for-4.2.patch
 
-# 进入qemu目录并打上补丁
-$ cd qemu && git apply ../0001-patch-for-2.12.patch
+# 进入qemu目录
+$ cd qemu 
+
+# 清理submodule
+$ for dir in `git submodule | awk '{print $2}'`; do eval "rm -rf $dir"; done
+
+# 更新submodule, 需要外网连接, 此步骤不可跳过
+$ git submodule update
+
+# 打上补丁文件
+$ git apply ../0001-patch-for-4.2.patch
 
 
 # 使用 docker 编译 libqemuio.a
