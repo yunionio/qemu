@@ -1,0 +1,1409 @@
+From 0a4b6b64b2cc2c029058f036ec36b2d27d13d841 Mon Sep 17 00:00:00 2001
+From: ioito <qu_xuan@icloud.com>
+Date: Wed, 30 Mar 2022 15:46:03 +0800
+Subject: [PATCH] patch for 2.12
+
+---
+ Makefile                     |   1 +
+ block/dirty-bitmap.c         |   5 +
+ block/io.c                   |  35 +++-
+ block/mirror.c               | 105 +++++++++++-
+ blockdev.c                   |  82 ++++++++--
+ cpus.c                       |  27 ++-
+ docs/qemu_logo.pdf           | Bin 9117 -> 0 bytes
+ hmp-commands.hx              |  30 +++-
+ hmp.c                        |  27 +++
+ hmp.h                        |   1 +
+ include/block/block_int.h    |  13 +-
+ include/block/dirty-bitmap.h |   1 +
+ include/block/mirror_io.h    |  18 ++
+ include/exec/cpu-common.h    |   1 +
+ include/qemu/hbitmap.h       |   8 +
+ libqemuio.c                  | 309 +++++++++++++++++++++++++++++++++++
+ libqemuio.h                  |  34 ++++
+ migration/channel.c          |   8 +
+ qapi/block-core.json         |  11 +-
+ qapi/transaction.json        |   2 +
+ util/hbitmap.c               |   6 +
+ 21 files changed, 694 insertions(+), 30 deletions(-)
+ delete mode 100644 docs/qemu_logo.pdf
+ create mode 100644 include/block/mirror_io.h
+ create mode 100644 libqemuio.c
+ create mode 100644 libqemuio.h
+
+diff --git a/Makefile b/Makefile
+index d71dd5bea4..64f05c25da 100644
+--- a/Makefile
++++ b/Makefile
+@@ -534,6 +534,7 @@ qemu-img.o: qemu-img-cmds.h
+ qemu-img$(EXESUF): qemu-img.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(COMMON_LDADDS)
+ qemu-nbd$(EXESUF): qemu-nbd.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(COMMON_LDADDS)
+ qemu-io$(EXESUF): qemu-io.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(COMMON_LDADDS)
++libqemuio.a: libqemuio.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(trace-obj-y) $(stub-obj-y) $(util-obj-y)
+ 
+ qemu-bridge-helper$(EXESUF): qemu-bridge-helper.o $(COMMON_LDADDS)
+ 
+diff --git a/block/dirty-bitmap.c b/block/dirty-bitmap.c
+index 967159479d..e6b4edf407 100644
+--- a/block/dirty-bitmap.c
++++ b/block/dirty-bitmap.c
+@@ -684,6 +684,11 @@ int64_t bdrv_get_dirty_count(BdrvDirtyBitmap *bitmap)
+     return hbitmap_count(bitmap->bitmap);
+ }
+ 
++bool bdrv_all_has_set(BdrvDirtyBitmap *bitmap)
++{
++    return hbitmap_count(bitmap->bitmap) == hbitmap_size(bitmap->bitmap);
++}
++
+ int64_t bdrv_get_meta_dirty_count(BdrvDirtyBitmap *bitmap)
+ {
+     return hbitmap_count(bitmap->meta);
+diff --git a/block/io.c b/block/io.c
+index bd9a19a9c4..b4ed34a5e5 100644
+--- a/block/io.c
++++ b/block/io.c
+@@ -29,6 +29,7 @@
+ #include "block/blockjob.h"
+ #include "block/blockjob_int.h"
+ #include "block/block_int.h"
++#include "block/mirror_io.h"
+ #include "qemu/cutils.h"
+ #include "qapi/error.h"
+ #include "qemu/error-report.h"
+@@ -1554,6 +1555,7 @@ static int coroutine_fn bdrv_aligned_pwritev(BdrvChild *child,
+     bdrv_debug_event(bs, BLKDBG_PWRITEV_DONE);
+ 
+     atomic_inc(&bs->write_gen);
++    // update block state dirty maps
+     bdrv_set_dirty(bs, offset, bytes);
+ 
+     stat64_max(&bs->wr_highest_offset, offset + bytes);
+@@ -1658,7 +1660,7 @@ fail:
+ /*
+  * Handle a write request in coroutine context
+  */
+-int coroutine_fn bdrv_co_pwritev(BdrvChild *child,
++int coroutine_fn do_bdrv_co_pwritev(BdrvChild *child,
+     int64_t offset, unsigned int bytes, QEMUIOVector *qiov,
+     BdrvRequestFlags flags)
+ {
+@@ -1792,6 +1794,37 @@ out:
+     return ret;
+ }
+ 
++static void mirror_wirte_report_bad_write(MirrorBlockDriver *bd)
++{
++    block_job_error_action(bd->s, BLOCKDEV_ON_ERROR_REPORT, false, -bd->ret);
++}
++
++int coroutine_fn bdrv_co_pwritev(BdrvChild *child,
++    int64_t offset, unsigned int bytes, QEMUIOVector *qiov,
++    BdrvRequestFlags flags)
++{
++    int ret;
++    BlockDriverState *bs = child->bs;
++    MirrorBlockDriver *bd = bs->mirror_bd;
++
++    if (bd != NULL && bd->mirror_state == BLOCK_MIRROR_START) {
++        /* marked dirty before write
++         * such drive_mirror will not mirror these blocks */
++        BlockDriverState *mirror_bs = bd->bs;
++        bdrv_set_dirty(mirror_bs, offset, bytes);
++
++        ret = do_bdrv_co_pwritev(mirror_bs->file, offset, bytes, qiov, flags);
++        if (ret < 0) {
++            bs->mirror_bd->mirror_state = BLOCK_MIRROR_FAILED;
++            bs->mirror_bd->ret = ret;
++
++            mirror_wirte_report_bad_write(bs->mirror_bd);
++        }
++    }
++
++    return do_bdrv_co_pwritev(child, offset, bytes, qiov, flags);
++}
++
+ static int coroutine_fn bdrv_co_do_writev(BdrvChild *child,
+     int64_t sector_num, int nb_sectors, QEMUIOVector *qiov,
+     BdrvRequestFlags flags)
+diff --git a/block/mirror.c b/block/mirror.c
+index 99da9c0858..ff91987c00 100644
+--- a/block/mirror.c
++++ b/block/mirror.c
+@@ -21,6 +21,7 @@
+ #include "qapi/qmp/qerror.h"
+ #include "qemu/ratelimit.h"
+ #include "qemu/bitmap.h"
++#include "block/mirror_io.h"
+ 
+ #define SLICE_TIME    100000000ULL /* ns */
+ #define MAX_IN_FLIGHT 16
+@@ -58,6 +59,7 @@ typedef struct MirrorBlockJob {
+     int64_t bdev_length;
+     unsigned long *cow_bitmap;
+     BdrvDirtyBitmap *dirty_bitmap;
++    BdrvDirtyBitmap *mirror_dirty_bitmap;
+     BdrvDirtyBitmapIter *dbi;
+     uint8_t *buf;
+     QSIMPLEQ_HEAD(, MirrorBuffer) buf_free;
+@@ -146,7 +148,12 @@ static void mirror_write_complete(void *opaque, int ret)
+         if (action == BLOCK_ERROR_ACTION_REPORT && s->ret >= 0) {
+             s->ret = ret;
+         }
++    } else {
++        if (s->mirror_dirty_bitmap) {
++            bdrv_set_dirty_bitmap_locked(s->mirror_dirty_bitmap, op->offset, op->bytes);
++        }
+     }
++
+     mirror_iteration_done(op, ret);
+     aio_context_release(blk_get_aio_context(s->common.blk));
+ }
+@@ -339,9 +346,25 @@ static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
+         trace_mirror_restart_iter(s, bdrv_get_dirty_count(s->dirty_bitmap));
+         assert(offset >= 0);
+     }
++    if (s->mirror_dirty_bitmap) {
++        bdrv_dirty_bitmap_lock(s->mirror_dirty_bitmap);
++        while (bdrv_get_dirty_locked(source->mirror_bd->bs, s->mirror_dirty_bitmap, offset)) {
++            /* find dirty bit in dirty_bitmap but not in mirror_dirty_map */
++            offset = bdrv_dirty_iter_next(s->dbi);
++            if (offset < 0) {
++                nb_chunks = 0;
++                break;
++            }
++        }
++        bdrv_dirty_bitmap_unlock(s->mirror_dirty_bitmap);
++    }
+     bdrv_dirty_bitmap_unlock(s->dirty_bitmap);
++    if (nb_chunks <= 0) {
++        return delay_ns;
++    }
+ 
+     first_chunk = offset / s->granularity;
++    /* check first_chunk is in flight */
+     while (test_bit(first_chunk, s->in_flight_bitmap)) {
+         trace_mirror_yield_in_flight(s, offset, s->in_flight);
+         mirror_wait_for_io(s);
+@@ -352,12 +375,16 @@ static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
+     /* Find the number of consective dirty chunks following the first dirty
+      * one, and wait for in flight requests in them. */
+     bdrv_dirty_bitmap_lock(s->dirty_bitmap);
++    if (s->mirror_dirty_bitmap) {
++        bdrv_dirty_bitmap_lock(s->mirror_dirty_bitmap);
++    }
+     while (nb_chunks * s->granularity < s->buf_size) {
+         int64_t next_dirty;
+         int64_t next_offset = offset + nb_chunks * s->granularity;
+         int64_t next_chunk = next_offset / s->granularity;
+         if (next_offset >= s->bdev_length ||
+-            !bdrv_get_dirty_locked(source, s->dirty_bitmap, next_offset)) {
++            !bdrv_get_dirty_locked(source, s->dirty_bitmap, next_offset) ||
++            bdrv_get_dirty_locked(NULL, s->mirror_dirty_bitmap, next_offset)) {
+             break;
+         }
+         if (test_bit(next_chunk, s->in_flight_bitmap)) {
+@@ -380,6 +407,9 @@ static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
+      */
+     bdrv_reset_dirty_bitmap_locked(s->dirty_bitmap, offset,
+                                    nb_chunks * s->granularity);
++    if (s->mirror_dirty_bitmap) {
++        bdrv_dirty_bitmap_unlock(s->mirror_dirty_bitmap);
++    }
+     bdrv_dirty_bitmap_unlock(s->dirty_bitmap);
+ 
+     bitmap_set(s->in_flight_bitmap, offset / s->granularity, nb_chunks);
+@@ -429,6 +459,9 @@ static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
+         }
+ 
+         io_bytes = mirror_clip_bytes(s, offset, io_bytes);
++        if (s->mirror_dirty_bitmap){
++            bdrv_dirty_bitmap_lock(s->mirror_dirty_bitmap);
++        }
+         switch (mirror_method) {
+         case MIRROR_METHOD_COPY:
+             io_bytes = io_bytes_acct = mirror_do_read(s, offset, io_bytes);
+@@ -446,6 +479,9 @@ static uint64_t coroutine_fn mirror_iteration(MirrorBlockJob *s)
+         default:
+             abort();
+         }
++        if (s->mirror_dirty_bitmap){
++            bdrv_dirty_bitmap_unlock(s->mirror_dirty_bitmap);
++        }
+         assert(io_bytes);
+         offset += io_bytes;
+         nb_chunks -= DIV_ROUND_UP(io_bytes, s->granularity);
+@@ -499,6 +535,10 @@ static void mirror_exit(BlockJob *job, void *opaque)
+     Error *local_err = NULL;
+ 
+     bdrv_release_dirty_bitmap(src, s->dirty_bitmap);
++    if (s->mirror_dirty_bitmap) {
++        bdrv_release_dirty_bitmap(src->mirror_bd->bs, s->mirror_dirty_bitmap);
++        g_free(s->source->mirror_bd);
++    }
+ 
+     /* Make sure that the source BDS doesn't go away before we called
+      * block_job_completed(). */
+@@ -613,6 +653,11 @@ static int coroutine_fn mirror_dirty_init(MirrorBlockJob *s)
+     int ret;
+     int64_t count;
+ 
++    if (s->mirror_dirty_bitmap) {
++        bdrv_set_dirty_bitmap(s->dirty_bitmap, 0, s->bdev_length);
++        bs->mirror_bd->mirror_state = BLOCK_MIRROR_START;
++    }
++
+     if (base == NULL && !bdrv_has_zero_init(target_bs)) {
+         if (!bdrv_can_write_zeroes_with_unmap(target_bs)) {
+             bdrv_set_dirty_bitmap(s->dirty_bitmap, 0, s->bdev_length);
+@@ -789,9 +834,26 @@ static void coroutine_fn mirror_run(void *opaque)
+             goto immediate_exit;
+         }
+ 
++        // block mirror failed
++        if (s->mirror_dirty_bitmap &&
++            s->source->mirror_bd->mirror_state == BLOCK_MIRROR_FAILED) {
++            ret = s->source->mirror_bd->ret;
++            goto immediate_exit;
++        }
++
+         block_job_pause_point(&s->common);
+ 
+-        cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++        if (s->mirror_dirty_bitmap && bdrv_all_has_set(s->mirror_dirty_bitmap)) {
++            /*
++             * 1. check mirror_dirty_bitmap is all bit has set
++             * 2. check mirror_dirty_bitmp before write to target
++             * 3. update mirror_dirty_bitmap after write to target
++             */
++            cnt = 0;
++        } else {
++            cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++        }
++
+         /* s->common.offset contains the number of bytes already processed so
+          * far, cnt is the number of dirty bytes remaining and
+          * s->bytes_in_flight is the number of bytes currently being
+@@ -829,13 +891,19 @@ static void coroutine_fn mirror_run(void *opaque)
+                  * report completion.  This way, block-job-cancel will leave
+                  * the target in a consistent state.
+                  */
++                // block job ready
+                 block_job_event_ready(&s->common);
+                 s->synced = true;
+             }
+ 
+             should_complete = s->should_complete ||
+                 block_job_is_cancelled(&s->common);
+-            cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++            if (s->mirror_dirty_bitmap && bdrv_all_has_set(s->mirror_dirty_bitmap)) {
++                /* should_complete = true; can't set complete, will lost mirror job*/
++                cnt = 0;
++            } else {
++                cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++            }
+         }
+ 
+         if (cnt == 0 && should_complete) {
+@@ -852,7 +920,11 @@ static void coroutine_fn mirror_run(void *opaque)
+             trace_mirror_before_drain(s, cnt);
+ 
+             bdrv_drained_begin(bs);
+-            cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++            if (s->mirror_dirty_bitmap && bdrv_all_has_set(s->mirror_dirty_bitmap)) {
++                cnt = 0;
++            } else {
++                cnt = bdrv_get_dirty_count(s->dirty_bitmap);
++            }
+             if (cnt > 0 || mirror_flush(s) < 0) {
+                 bdrv_drained_end(bs);
+                 continue;
+@@ -871,6 +943,10 @@ static void coroutine_fn mirror_run(void *opaque)
+ 
+         if (s->synced && !should_complete) {
+             delay_ns = (s->in_flight == 0 && cnt == 0 ? SLICE_TIME : 0);
++            if (s->mirror_dirty_bitmap && bdrv_all_has_set(s->mirror_dirty_bitmap)) {
++                // there is no data need sent, increase delay time
++                delay_ns *= 10;
++            }
+         }
+         trace_mirror_before_sleep(s, cnt, s->synced, delay_ns);
+         block_job_sleep_ns(&s->common, delay_ns);
+@@ -1115,7 +1191,7 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
+                              const BlockJobDriver *driver,
+                              bool is_none_mode, BlockDriverState *base,
+                              bool auto_complete, const char *filter_node_name,
+-                             bool is_mirror,
++                             bool is_mirror, bool block_replication,
+                              Error **errp)
+ {
+     MirrorBlockJob *s;
+@@ -1202,6 +1278,12 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
+     if (ret < 0) {
+         goto fail;
+     }
++    if (block_replication) {
++        bs->mirror_bd = g_new0(MirrorBlockDriver, 1);
++        bs->mirror_bd->bs = target;
++        bs->mirror_bd->mirror_state = BLOCK_MIRROR_INIT;
++        bs->mirror_bd->s = &s->common;
++    }
+     if (is_mirror) {
+         /* XXX: Mirror target could be a NBD server of target QEMU in the case
+          * of non-shared block migration. To allow migration completion, we
+@@ -1229,6 +1311,12 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
+     if (!s->dirty_bitmap) {
+         goto fail;
+     }
++    if (block_replication) {
++        s->mirror_dirty_bitmap = bdrv_create_dirty_bitmap(bs->mirror_bd->bs, granularity, NULL, errp);
++        if (!s->mirror_dirty_bitmap) {
++            goto fail;
++        }
++    }
+ 
+     /* Required permissions are already taken with blk_new() */
+     block_job_add_bdrv(&s->common, "target", target, 0, BLK_PERM_ALL,
+@@ -1280,7 +1368,8 @@ void mirror_start(const char *job_id, BlockDriverState *bs,
+                   MirrorSyncMode mode, BlockMirrorBackingMode backing_mode,
+                   BlockdevOnError on_source_error,
+                   BlockdevOnError on_target_error,
+-                  bool unmap, const char *filter_node_name, Error **errp)
++                  bool unmap, bool block_replication,
++                  const char *filter_node_name, Error **errp)
+ {
+     bool is_none_mode;
+     BlockDriverState *base;
+@@ -1295,7 +1384,7 @@ void mirror_start(const char *job_id, BlockDriverState *bs,
+                      speed, granularity, buf_size, backing_mode,
+                      on_source_error, on_target_error, unmap, NULL, NULL,
+                      &mirror_job_driver, is_none_mode, base, false,
+-                     filter_node_name, true, errp);
++                     filter_node_name, true, block_replication, errp);
+ }
+ 
+ void commit_active_start(const char *job_id, BlockDriverState *bs,
+@@ -1318,7 +1407,7 @@ void commit_active_start(const char *job_id, BlockDriverState *bs,
+                      MIRROR_LEAVE_BACKING_CHAIN,
+                      on_error, on_error, true, cb, opaque,
+                      &commit_active_job_driver, false, base, auto_complete,
+-                     filter_node_name, false, &local_err);
++                     filter_node_name, false, false, &local_err);
+     if (local_err) {
+         error_propagate(errp, local_err);
+         goto error_restore_flags;
+diff --git a/blockdev.c b/blockdev.c
+index c31bf3d98d..8bd0d3abfb 100644
+--- a/blockdev.c
++++ b/blockdev.c
+@@ -1252,6 +1252,34 @@ void qmp_blockdev_snapshot_sync(bool has_device, const char *device,
+     blockdev_do_action(&action, errp);
+ }
+ 
++void qmp_reload_disk_snapshot_blkdev_sync(bool has_device, const char *device,
++                                          bool has_node_name, const char *node_name,
++                                          const char *snapshot_file,
++                                          bool has_snapshot_node_name,
++                                          const char *snapshot_node_name,
++                                          bool has_format, const char *format,
++                                          bool has_mode, NewImageMode mode, Error **errp)
++{
++    BlockdevSnapshotSync snapshot = {
++        .has_device = has_device,
++        .device = (char *) device,
++        .has_node_name = has_node_name,
++        .node_name = (char *) node_name,
++        .snapshot_file = (char *) snapshot_file,
++        .has_snapshot_node_name = has_snapshot_node_name,
++        .snapshot_node_name = (char *) snapshot_node_name,
++        .has_format = has_format,
++        .format = (char *) format,
++        .has_mode = has_mode,
++        .mode = mode,
++    };
++    TransactionAction action = {
++        .type = TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC,
++        .u.blockdev_snapshot_sync.data = &snapshot,
++    };
++    blockdev_do_action(&action, errp);
++}
++
+ void qmp_blockdev_snapshot(const char *node, const char *overlay,
+                            Error **errp)
+ {
+@@ -1655,6 +1683,7 @@ static void external_snapshot_prepare(BlkActionState *common,
+             snapshot_ref = s->overlay;
+         }
+         break;
++    case TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC:
+     case TRANSACTION_ACTION_KIND_BLOCKDEV_SNAPSHOT_SYNC:
+         {
+             BlockdevSnapshotSync *s = action->u.blockdev_snapshot_sync.data;
+@@ -1706,7 +1735,8 @@ static void external_snapshot_prepare(BlkActionState *common,
+         goto out;
+     }
+ 
+-    if (action->type == TRANSACTION_ACTION_KIND_BLOCKDEV_SNAPSHOT_SYNC) {
++    if (action->type == TRANSACTION_ACTION_KIND_BLOCKDEV_SNAPSHOT_SYNC ||
++        action->type == TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC) {
+         BlockdevSnapshotSync *s = action->u.blockdev_snapshot_sync.data;
+         const char *format = s->has_format ? s->format : "qcow2";
+         enum NewImageMode mode;
+@@ -1726,7 +1756,9 @@ static void external_snapshot_prepare(BlkActionState *common,
+ 
+         flags = state->old_bs->open_flags;
+         flags &= ~(BDRV_O_SNAPSHOT | BDRV_O_COPY_ON_READ);
+-        flags |= BDRV_O_NO_BACKING;
++        if (action->type != TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC) {
++            flags |= BDRV_O_NO_BACKING;
++        }
+ 
+         /* create new image w/backing file */
+         mode = s->has_mode ? s->mode : NEW_IMAGE_MODE_ABSOLUTE_PATHS;
+@@ -1770,7 +1802,7 @@ static void external_snapshot_prepare(BlkActionState *common,
+         goto out;
+     }
+ 
+-    if (state->new_bs->backing != NULL) {
++    if (action->type != TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC && state->new_bs->backing != NULL) {
+         error_setg(errp, "The snapshot already has a backing image");
+         goto out;
+     }
+@@ -1782,15 +1814,26 @@ static void external_snapshot_prepare(BlkActionState *common,
+ 
+     bdrv_set_aio_context(state->new_bs, aio_context);
+ 
+-    /* This removes our old bs and adds the new bs. This is an operation that
+-     * can fail, so we need to do it in .prepare; undoing it for abort is
+-     * always possible. */
+-    bdrv_ref(state->new_bs);
+-    bdrv_append(state->new_bs, state->old_bs, &local_err);
+-    if (local_err) {
+-        error_propagate(errp, local_err);
+-        goto out;
+-    }
++    if (action->type != TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC) {
++        /* This removes our old bs and adds the new bs. This is an operation that
++         * can fail, so we need to do it in .prepare; undoing it for abort is
++         * always possible. */
++        bdrv_ref(state->new_bs);
++        bdrv_append(state->new_bs, state->old_bs, &local_err);
++        if (local_err) {
++            error_propagate(errp, local_err);
++            goto out;
++        }
++    } else {
++        bdrv_replace_node(state->old_bs, state->new_bs, &local_err);
++        if (local_err) {
++            error_propagate(errp, local_err);
++            goto out;
++        }
++        if (state->old_bs->refcnt > 0) {
++            bdrv_unref(state->old_bs);
++        }
++    } 
+     state->overlay_appended = true;
+ 
+ out:
+@@ -2176,6 +2219,13 @@ static const BlkActionOps actions[] = {
+         .abort = external_snapshot_abort,
+         .clean = external_snapshot_clean,
+     },
++    [TRANSACTION_ACTION_KIND_RELOAD_DISK_SNAPSHOT_BLKDEV_SYNC] = {
++        .instance_size = sizeof(ExternalSnapshotState),
++        .prepare  = external_snapshot_prepare,
++        .commit   = NULL,
++        .abort = external_snapshot_abort,
++        .clean = external_snapshot_clean,
++    },
+     [TRANSACTION_ACTION_KIND_DRIVE_BACKUP] = {
+         .instance_size = sizeof(DriveBackupState),
+         .prepare = drive_backup_prepare,
+@@ -3534,6 +3584,7 @@ static void blockdev_mirror_common(const char *job_id, BlockDriverState *bs,
+                                    BlockdevOnError on_target_error,
+                                    bool has_unmap, bool unmap,
+                                    bool has_filter_node_name,
++                                   bool block_replication,
+                                    const char *filter_node_name,
+                                    Error **errp)
+ {
+@@ -3588,7 +3639,8 @@ static void blockdev_mirror_common(const char *job_id, BlockDriverState *bs,
+     mirror_start(job_id, bs, target,
+                  has_replaces ? replaces : NULL,
+                  speed, granularity, buf_size, sync, backing_mode,
+-                 on_source_error, on_target_error, unmap, filter_node_name,
++                 on_source_error, on_target_error, unmap,
++                 block_replication, filter_node_name,
+                  errp);
+ }
+ 
+@@ -3734,7 +3786,7 @@ void qmp_drive_mirror(DriveMirror *arg, Error **errp)
+                            arg->has_on_source_error, arg->on_source_error,
+                            arg->has_on_target_error, arg->on_target_error,
+                            arg->has_unmap, arg->unmap,
+-                           false, NULL,
++                           false, arg->block_replication, NULL,
+                            &local_err);
+     bdrv_unref(target_bs);
+     error_propagate(errp, local_err);
+@@ -3786,7 +3838,7 @@ void qmp_blockdev_mirror(bool has_job_id, const char *job_id,
+                            has_on_source_error, on_source_error,
+                            has_on_target_error, on_target_error,
+                            true, true,
+-                           has_filter_node_name, filter_node_name,
++                           has_filter_node_name, false, filter_node_name,
+                            &local_err);
+     error_propagate(errp, local_err);
+ 
+diff --git a/cpus.c b/cpus.c
+index 6fa701e423..e85c7c3809 100644
+--- a/cpus.c
++++ b/cpus.c
+@@ -1022,12 +1022,37 @@ static int do_vm_stop(RunState state, bool send_stop)
+     return ret;
+ }
+ 
++void cpu_physical_memory_clean(void)
++{
++    uint8_t buf[4096];
++    int i;
++    uint32_t l;
++    int64_t offset = 0;
++    int64_t range = ram_size/2;
++    #define GiB 1024*1024*1024
++    for (i = 0; i < sizeof(buf); i++) {
++        buf[i] = 0;
++    }
++    if (ram_size > 1*GiB && range < ram_size - 1*GiB) {
++        range = ram_size - 1*GiB;
++    }
++    qemu_log("pmemclean range %ld(%lx) start\n", range, (uint64_t)(range));
++    while (offset < range) {
++        l = sizeof(buf);
++        cpu_physical_memory_write(offset, buf, l);
++        offset += l;
++    }
++    qemu_log("pmemclean range %ld(%lx) end\n", range, (uint64_t)(range));
++}
++
+ /* Special vm_stop() variant for terminating the process.  Historically clients
+  * did not expect a QMP STOP event and so we need to retain compatibility.
+  */
+ int vm_shutdown(void)
+ {
+-    return do_vm_stop(RUN_STATE_SHUTDOWN, false);
++    int ret = do_vm_stop(RUN_STATE_SHUTDOWN, false);
++    cpu_physical_memory_clean();
++    return ret;
+ }
+ 
+ static bool cpu_can_run(CPUState *cpu)
+diff --git a/docs/qemu_logo.pdf b/docs/qemu_logo.pdf
+deleted file mode 100644
+index 294cb7dec50de73c786925671300fb0abdf9d641..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 9117
+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
+
+diff --git a/hmp-commands.hx b/hmp-commands.hx
+index 35d862a5d2..078d020850 100644
+--- a/hmp-commands.hx
++++ b/hmp-commands.hx
+@@ -1170,6 +1170,28 @@ STEXI
+ @item snapshot_blkdev
+ @findex snapshot_blkdev
+ Snapshot device, using snapshot file as target if provided
++ETEXI
++
++    {
++        .name       = "reload_disk_snapshot_blkdev",
++        .args_type  = "reuse:-n,device:B,snapshot-file:s?,format:s?",
++        .params     = "[-n] device [new-image-file] [format]",
++        .help       = "initiates a live snapshot\n\t\t\t"
++                      "of device, and reload disk backing chain.\n\t\t\t"
++                      "If a new image file is specified, the\n\t\t\t"
++                      "new image file will become the new root image.\n\t\t\t"
++                      "If format is specified, the snapshot file will\n\t\t\t"
++                      "be created in that format.\n\t\t\t"
++                      "The default format is qcow2.  The -n flag requests QEMU\n\t\t\t"
++                      "to reuse the image found in new-image-file, instead of\n\t\t\t"
++                      "recreating it from scratch.",
++        .cmd        = hmp_reload_disk_snapshot_blkdev,
++    },
++
++STEXI
++@item reload_disk_snapshot_blkdev
++@findex reload_disk_snapshot_blkdev
++Snapshot device, using snapshot file as target if provided
+ ETEXI
+ 
+     {
+@@ -1208,8 +1230,8 @@ ETEXI
+ 
+     {
+         .name       = "drive_mirror",
+-        .args_type  = "reuse:-n,full:-f,device:B,target:s,format:s?",
+-        .params     = "[-n] [-f] device target [format]",
++        .args_type  = "reuse:-n,full:-f,block_replication:-c,device:B,target:s,format:s?",
++        .params     = "[-n] [-f] [-c] device target [format]",
+         .help       = "initiates live storage\n\t\t\t"
+                       "migration for a device. The device's contents are\n\t\t\t"
+                       "copied to the new image file, including data that\n\t\t\t"
+@@ -1217,7 +1239,9 @@ ETEXI
+                       "The -n flag requests QEMU to reuse the image found\n\t\t\t"
+                       "in new-image-file, instead of recreating it from scratch.\n\t\t\t"
+                       "The -f flag requests QEMU to copy the whole disk,\n\t\t\t"
+-                      "so that the result does not need a backing file.\n\t\t\t",
++                      "so that the result does not need a backing file.\n\t\t\t"
++                      "The -c flag requests QEMU to mirror the wirte request,\n\t\t\t"
++                      "and will not copy source disk to target\n\t\t\t",
+         .cmd        = hmp_drive_mirror,
+     },
+ STEXI
+diff --git a/hmp.c b/hmp.c
+index a25c7bd9a8..c17592c530 100644
+--- a/hmp.c
++++ b/hmp.c
+@@ -1197,6 +1197,7 @@ void hmp_drive_mirror(Monitor *mon, const QDict *qdict)
+     const char *format = qdict_get_try_str(qdict, "format");
+     bool reuse = qdict_get_try_bool(qdict, "reuse", false);
+     bool full = qdict_get_try_bool(qdict, "full", false);
++    bool block_replication = qdict_get_try_bool(qdict, "block_replication", false);
+     Error *err = NULL;
+     DriveMirror mirror = {
+         .device = (char *)qdict_get_str(qdict, "device"),
+@@ -1207,6 +1208,7 @@ void hmp_drive_mirror(Monitor *mon, const QDict *qdict)
+         .has_mode = true,
+         .mode = reuse ? NEW_IMAGE_MODE_EXISTING : NEW_IMAGE_MODE_ABSOLUTE_PATHS,
+         .unmap = true,
++        .block_replication = block_replication,
+     };
+ 
+     if (!filename) {
+@@ -1274,6 +1276,31 @@ void hmp_snapshot_blkdev(Monitor *mon, const QDict *qdict)
+     hmp_handle_error(mon, &err);
+ }
+ 
++void hmp_reload_disk_snapshot_blkdev(Monitor *mon, const QDict *qdict)
++{
++    const char *device = qdict_get_str(qdict, "device");
++    const char *filename = qdict_get_try_str(qdict, "snapshot-file");
++    const char *format = qdict_get_try_str(qdict, "format");
++    bool reuse = qdict_get_try_bool(qdict, "reuse", false);
++    enum NewImageMode mode;
++    Error *err = NULL;
++
++    if (!filename) {
++        /* In the future, if 'snapshot-file' is not specified, the snapshot
++           will be taken internally. Today it's actually required. */
++        error_setg(&err, QERR_MISSING_PARAMETER, "snapshot-file");
++        hmp_handle_error(mon, &err);
++        return;
++    }
++
++    mode = reuse ? NEW_IMAGE_MODE_EXISTING : NEW_IMAGE_MODE_ABSOLUTE_PATHS;
++    qmp_reload_disk_snapshot_blkdev_sync(true, device, false, NULL,
++                                         filename, false, NULL,
++                                         !!format, format,
++                                         true, mode, &err);
++    hmp_handle_error(mon, &err);
++}
++
+ void hmp_snapshot_blkdev_internal(Monitor *mon, const QDict *qdict)
+ {
+     const char *device = qdict_get_str(qdict, "device");
+diff --git a/hmp.h b/hmp.h
+index 4e2ec375b0..7fc718bacd 100644
+--- a/hmp.h
++++ b/hmp.h
+@@ -57,6 +57,7 @@ void hmp_block_passwd(Monitor *mon, const QDict *qdict);
+ void hmp_balloon(Monitor *mon, const QDict *qdict);
+ void hmp_block_resize(Monitor *mon, const QDict *qdict);
+ void hmp_snapshot_blkdev(Monitor *mon, const QDict *qdict);
++void hmp_reload_disk_snapshot_blkdev(Monitor *mon, const QDict *qdict);
+ void hmp_snapshot_blkdev_internal(Monitor *mon, const QDict *qdict);
+ void hmp_snapshot_delete_blkdev_internal(Monitor *mon, const QDict *qdict);
+ void hmp_drive_mirror(Monitor *mon, const QDict *qdict);
+diff --git a/include/block/block_int.h b/include/block/block_int.h
+index c4dd1d4bb8..f1df343230 100644
+--- a/include/block/block_int.h
++++ b/include/block/block_int.h
+@@ -35,6 +35,7 @@
+ #include "block/snapshot.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/throttle.h"
++#include "block/mirror_io.h"
+ 
+ #define BLOCK_FLAG_LAZY_REFCOUNTS   8
+ 
+@@ -616,6 +617,12 @@ struct BdrvChild {
+     QLIST_ENTRY(BdrvChild) next_parent;
+ };
+ 
++typedef enum BlockMirrorState {
++    BLOCK_MIRROR_INIT,
++    BLOCK_MIRROR_START,
++    BLOCK_MIRROR_FAILED,
++} BlockMirrorState;
++
+ /*
+  * Note: the function bdrv_append() copies and swaps contents of
+  * BlockDriverStates, so if you add new fields to this struct, please
+@@ -756,6 +763,9 @@ struct BlockDriverState {
+ 
+     /* Only read/written by whoever has set active_flush_req to true.  */
+     unsigned int flushed_gen;             /* Flushed write generation */
++
++    /* Mirror block driver */
++    MirrorBlockDriver *mirror_bd;
+ };
+ 
+ struct BlockBackendRootState {
+@@ -986,7 +996,8 @@ void mirror_start(const char *job_id, BlockDriverState *bs,
+                   MirrorSyncMode mode, BlockMirrorBackingMode backing_mode,
+                   BlockdevOnError on_source_error,
+                   BlockdevOnError on_target_error,
+-                  bool unmap, const char *filter_node_name, Error **errp);
++                  bool unmap, bool block_replication,
++                  const char *filter_node_name, Error **errp);
+ 
+ /*
+  * backup_job_create:
+diff --git a/include/block/dirty-bitmap.h b/include/block/dirty-bitmap.h
+index 1ff8949b1b..1c85bc880e 100644
+--- a/include/block/dirty-bitmap.h
++++ b/include/block/dirty-bitmap.h
+@@ -84,6 +84,7 @@ void bdrv_reset_dirty_bitmap_locked(BdrvDirtyBitmap *bitmap,
+ int64_t bdrv_dirty_iter_next(BdrvDirtyBitmapIter *iter);
+ void bdrv_set_dirty_iter(BdrvDirtyBitmapIter *hbi, int64_t offset);
+ int64_t bdrv_get_dirty_count(BdrvDirtyBitmap *bitmap);
++bool bdrv_all_has_set(BdrvDirtyBitmap *bitmap);
+ int64_t bdrv_get_meta_dirty_count(BdrvDirtyBitmap *bitmap);
+ void bdrv_dirty_bitmap_truncate(BlockDriverState *bs, int64_t bytes);
+ bool bdrv_dirty_bitmap_readonly(const BdrvDirtyBitmap *bitmap);
+diff --git a/include/block/mirror_io.h b/include/block/mirror_io.h
+new file mode 100644
+index 0000000000..b0e929a5ea
+--- /dev/null
++++ b/include/block/mirror_io.h
+@@ -0,0 +1,18 @@
++//
++// Created by yaoqi wan on 2020-10-20.
++//
++
++#ifndef QEMU_MIRROR_IO_H
++#define QEMU_MIRROR_IO_H
++
++#include "block/blockjob.h"
++
++typedef struct MirrorBlockDriver {
++    BlockDriverState *bs;       /* mirror block driver state */
++    BlockJob *s;
++
++    int mirror_state;
++    int ret;                    /* remote write return value */
++} MirrorBlockDriver;
++
++#endif //QEMU_MIRROR_IO_H
+diff --git a/include/exec/cpu-common.h b/include/exec/cpu-common.h
+index 24d335f95d..31caab1a05 100644
+--- a/include/exec/cpu-common.h
++++ b/include/exec/cpu-common.h
+@@ -96,6 +96,7 @@ void *cpu_physical_memory_map(hwaddr addr,
+                               int is_write);
+ void cpu_physical_memory_unmap(void *buffer, hwaddr len,
+                                int is_write, hwaddr access_len);
++void cpu_physical_memory_clean(void);
+ void cpu_register_map_client(QEMUBH *bh);
+ void cpu_unregister_map_client(QEMUBH *bh);
+ 
+diff --git a/include/qemu/hbitmap.h b/include/qemu/hbitmap.h
+index 6b6490ecad..41b2c0869a 100644
+--- a/include/qemu/hbitmap.h
++++ b/include/qemu/hbitmap.h
+@@ -108,6 +108,14 @@ int hbitmap_granularity(const HBitmap *hb);
+  */
+ uint64_t hbitmap_count(const HBitmap *hb);
+ 
++/**
++ * hbitmap_size:
++ * @hb: HBitmap to operate on.
++ *
++ * Return the number of bits in the HBitmap.
++ */
++uint64_t hbitmap_size(const HBitmap *hb);
++
+ /**
+  * hbitmap_set:
+  * @hb: HBitmap to operate on.
+diff --git a/libqemuio.c b/libqemuio.c
+new file mode 100644
+index 0000000000..59b4d48d79
+--- /dev/null
++++ b/libqemuio.c
+@@ -0,0 +1,309 @@
++#include "libqemuio.h"
++
++
++struct QemuioBlk {
++    BlockBackend *blk;
++    char *filename;
++    bool readonly;
++    unsigned int ref_count;
++
++    QemuioBlk *next;
++};
++
++static QemuioBlk *qemuio_blk_list_head;
++static bool is_init;
++static QemuMutex mutex;
++
++void dump_buffer(const void *buffer, int64_t offset, int64_t len);
++
++static void qemuio_blk_free_item(QemuioBlk *qemuio_blk) {
++    bdrv_drain(blk_bs(qemuio_blk->blk));
++    blk_unref(qemuio_blk->blk);
++    g_free(qemuio_blk->filename);
++    g_free(qemuio_blk);
++}
++
++static QemuioBlk *qemuio_blk_new_item(char *filename, bool readonly, BlockBackend *blk) {
++    QemuioBlk *qemuio_blk = g_new0(QemuioBlk, 1);
++    if (!qemuio_blk) {
++        return NULL;
++    }
++    qemuio_blk->filename = g_strdup(filename);
++    qemuio_blk->readonly = readonly;
++    qemuio_blk->blk = blk;
++    qemuio_blk->ref_count = 1;
++    return qemuio_blk;
++}
++
++static void qemuio_blk_list_insert_head(QemuioBlk *qemuio_blk)
++{
++    qemu_mutex_lock(&mutex);
++    if (qemuio_blk_list_head != NULL) {
++        qemuio_blk->next = qemuio_blk_list_head;
++    } else {
++        qemuio_blk_list_head = qemuio_blk;
++    }
++    qemu_mutex_unlock(&mutex);
++}
++
++static QemuioBlk *qemuio_blk_list_lookup(char *filename, bool readonly)
++{
++    if (filename == NULL || qemuio_blk_list_head == NULL) {
++        return NULL;
++    }
++    qemu_mutex_lock(&mutex);
++    QemuioBlk *iter = qemuio_blk_list_head;
++    while (iter != NULL) {
++        if (g_strcmp0(filename, iter->filename) == 0 && iter->readonly == readonly) {
++            break;
++        }
++        iter = iter->next;
++    }
++    qemu_mutex_unlock(&mutex);
++    return iter;
++}
++
++static void qemuio_blk_list_remove_item(QemuioBlk *blk)
++{
++    if (blk == NULL || qemuio_blk_list_head == NULL) {
++        return;
++    }
++
++    qemu_mutex_lock(&mutex);
++    QemuioBlk *iter = qemuio_blk_list_head;
++    if (iter == blk) {
++        qemuio_blk_list_head = iter->next;
++    } else {
++        while (iter->next != NULL && iter->next != blk) {
++            iter = iter->next;
++        }
++        if (iter->next == blk) {
++            iter->next = blk->next;
++        }
++    }
++    qemu_mutex_unlock(&mutex);
++}
++
++static BlockBackend *openfile(char *name, int flags, bool writethrough, QDict *opts)
++{
++    Error *local_err = NULL;
++    BlockDriverState *bs;
++    BlockBackend *qemuio_blk = NULL;
++
++    qemuio_blk = blk_new_open(name, NULL, opts, flags, &local_err);
++    if (!qemuio_blk) {
++        error_reportf_err(local_err, "can't open%s%s: ",
++                          name ? " device " : "", name ? : "");
++        return NULL;
++    }
++
++    bs = blk_bs(qemuio_blk);
++    if (bs != NULL && bdrv_is_encrypted(bs)) {
++        fprintf(stderr, "Cannot open encrypted block");
++        goto error;
++    }
++    blk_set_enable_write_cache(qemuio_blk, !writethrough);
++
++    return qemuio_blk;
++
++error:
++    blk_unref(qemuio_blk);
++
++    return NULL;
++}
++
++
++static int do_pwrite(BlockBackend *blk, char *buf, int64_t offset,
++                     int64_t count, int flags, int64_t *total)
++{
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    *total = blk_pwrite(blk, offset, (uint8_t *)buf, count, flags);
++    if (*total < 0) {
++        return *total;
++    }
++    return 1;
++}
++
++
++static int do_pread(BlockBackend *blk, char *buf, int64_t offset,
++                    int64_t count, int64_t *total)
++{
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    *total = blk_pread(blk, offset, (uint8_t *)buf, count);
++    if (*total < 0) {
++        return *total;
++    }
++    return 1;
++}
++
++void dump_buffer(const void *buffer, int64_t offset, int64_t len)
++{
++    uint64_t i;
++    int j;
++    const uint8_t *p;
++
++    for (i = 0, p = buffer; i < len; i += 16) {
++        const uint8_t *s = p;
++
++        printf("%08" PRIx64 ":  ", offset + i);
++        for (j = 0; j < 16 && i + j < len; j++, p++) {
++            printf("%02x ", *p);
++        }
++        printf(" ");
++        for (j = 0; j < 16 && i + j < len; j++, s++) {
++            if (isalnum(*s)) {
++                printf("%c", *s);
++            } else {
++                printf(".");
++            }
++        }
++        printf("\n");
++    }
++}
++
++
++typedef struct {
++    BlockBackend *blk;
++    int64_t offset;
++    int64_t count;
++    int64_t *total;
++    int flags;
++    int ret;
++    bool done;
++} CoWriteZeroes;
++
++
++static void coroutine_fn co_pwrite_zeroes_entry(void *opaque)
++{
++    CoWriteZeroes *data = opaque;
++
++    data->ret = blk_co_pwrite_zeroes(data->blk, data->offset, data->count,
++                                     data->flags);
++    data->done = true;
++    if (data->ret < 0) {
++        *data->total = data->ret;
++        return;
++    }
++
++    *data->total = data->count;
++}
++
++
++static int do_co_pwrite_zeroes(BlockBackend *blk, int64_t offset,
++                               int64_t count, int flags, int64_t *total)
++{
++    Coroutine *co;
++    CoWriteZeroes data = {
++        .blk    = blk,
++        .offset = offset,
++        .count  = count,
++        .total  = total,
++        .flags  = flags,
++        .done   = false,
++    };
++
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    co = qemu_coroutine_create(co_pwrite_zeroes_entry, &data);
++    bdrv_coroutine_enter(blk_bs(blk), co);
++    while (!data.done) {
++        aio_poll(blk_get_aio_context(blk), true);
++    }
++    if (data.ret < 0) {
++        return data.ret;
++    } else {
++        return 1;
++    }
++}
++
++
++int write_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset,
++                int64_t count, int flags, int64_t *total) {
++    if (qemuio_blk == NULL) {
++        return -1;
++    }
++    if (buf != NULL) {
++        return do_pwrite(qemuio_blk->blk, buf, offset, count, flags, total);
++    } else {
++        return do_co_pwrite_zeroes(qemuio_blk->blk, offset, count, flags, total);
++    }
++}
++
++
++int read_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int64_t *total)
++{
++    if (qemuio_blk == NULL || buf == NULL) {
++        return -EINVAL;
++    }
++    int cnt = do_pread(qemuio_blk->blk, buf, offset, count, total);
++
++#ifdef DEBUG_READ
++    dump_buffer(buf, offset, count);
++#endif
++    return cnt;
++}
++
++
++QemuioBlk *open_qcow2(char* filename, bool readonly) {
++    if (!is_init) {
++        return NULL;
++    }
++
++    int oflags = BDRV_O_UNMAP;
++    bool writethrough = true;
++    QemuioBlk *qemuio_blk = NULL;
++
++    if (!readonly) {
++        oflags |= BDRV_O_NOCACHE;
++        oflags |= BDRV_O_RDWR;
++        writethrough = false;
++    }
++    qemuio_blk = qemuio_blk_list_lookup(filename, readonly);
++    if (qemuio_blk == NULL) {
++        QDict *opts = qdict_new();
++        BlockBackend *blk = openfile(filename, oflags, writethrough, opts);
++        if (blk) {
++            qemuio_blk = qemuio_blk_new_item(filename, readonly, blk);
++            qemuio_blk_list_insert_head(qemuio_blk);
++        }
++    } else {
++        qemuio_blk->ref_count++;
++    }
++    return qemuio_blk;
++}
++
++
++void close_qcow2(QemuioBlk *qemuio_blk) {
++    if (qemuio_blk != NULL && atomic_dec_fetch(&qemuio_blk->ref_count) == 0) {
++        qemuio_blk_list_remove_item(qemuio_blk);
++        qemuio_blk_free_item(qemuio_blk);
++    }
++}
++
++int64_t qcow2_get_length(QemuioBlk *qemuio_blk) {
++    if (qemuio_blk == NULL) {
++        return -1;
++    }
++    return blk_getlength(qemuio_blk->blk);
++}
++
++void qemuio_init(void) {
++    if (!is_init) {
++        bdrv_init();
++        Error *local_error = NULL;
++        if (qemu_init_main_loop(&local_error)) {
++            error_report_err(local_error);
++            exit(1);
++        }
++        is_init = true;
++        qemu_mutex_init(&mutex);
++    }
++}
+diff --git a/libqemuio.h b/libqemuio.h
+new file mode 100644
+index 0000000000..fc47f29c7a
+--- /dev/null
++++ b/libqemuio.h
+@@ -0,0 +1,34 @@
++#ifndef _LIB_QEMU_IO_H_
++#define _LIB_QEMU_IO_H_
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu-io.h"
++#include "qemu/error-report.h"
++#include "qemu/main-loop.h"
++#include "qemu/option.h"
++#include "qemu/config-file.h"
++#include "qemu/readline.h"
++#include "qemu/log.h"
++#include "qapi/qmp/qstring.h"
++#include "qom/object_interfaces.h"
++#include "sysemu/block-backend.h"
++#include <glib.h>
++#include "qemu/iov.h"
++#include "block/block_int.h"
++
++typedef struct QemuioBlk QemuioBlk;
++
++QemuioBlk *open_qcow2(char* filename, bool readonly);
++
++int write_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int flags, int64_t *total);
++
++int read_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int64_t *total);
++
++void close_qcow2(QemuioBlk *qemuio_blk);
++
++int64_t qcow2_get_length(QemuioBlk *qemuio_blk);
++
++void qemuio_init(void);
++
++#endif
+diff --git a/migration/channel.c b/migration/channel.c
+index c5eaf0fa0e..3da3abf734 100644
+--- a/migration/channel.c
++++ b/migration/channel.c
+@@ -71,6 +71,14 @@ void migration_channel_connect(MigrationState *s,
+             !object_dynamic_cast(OBJECT(ioc),
+                                  TYPE_QIO_CHANNEL_TLS)) {
+             migration_tls_channel_connect(s, ioc, hostname, &error);
++            if (!error) {
++                /* tls_channel_connect will call back to this
++                 * function after the TLS handshake,
++                 * so we mustn't call migrate_fd_connect until then
++                 */
++
++                return;
++            }
+         } else {
+             QEMUFile *f = qemu_fopen_channel_output(ioc);
+ 
+diff --git a/qapi/block-core.json b/qapi/block-core.json
+index 7da3bea6bc..ada25ba365 100644
+--- a/qapi/block-core.json
++++ b/qapi/block-core.json
+@@ -1438,6 +1438,14 @@
+ { 'command': 'blockdev-snapshot-sync',
+   'data': 'BlockdevSnapshotSync' }
+ 
++##
++# @reload-disk-snapshot-blkdev-sync:
++#
++# Hack the blockdev-snapshot-sync, reload the whole disk chain
++#
++##
++{ 'command': 'reload-disk-snapshot-blkdev-sync',
++  'data': 'BlockdevSnapshotSync' }
+ 
+ ##
+ # @blockdev-snapshot:
+@@ -1776,6 +1784,7 @@
+ #         target image sectors will be unmapped; otherwise, zeroes will be
+ #         written. Both will result in identical contents.
+ #         Default is true. (Since 2.4)
++# @block-replication: sync write to target destination, only mirror once
+ #
+ # Since: 1.3
+ ##
+@@ -1786,7 +1795,7 @@
+             '*speed': 'int', '*granularity': 'uint32',
+             '*buf-size': 'int', '*on-source-error': 'BlockdevOnError',
+             '*on-target-error': 'BlockdevOnError',
+-            '*unmap': 'bool' } }
++            '*unmap': 'bool', '*block-replication': 'bool' } }
+ 
+ ##
+ # @BlockDirtyBitmap:
+diff --git a/qapi/transaction.json b/qapi/transaction.json
+index bd312792da..a42aeed860 100644
+--- a/qapi/transaction.json
++++ b/qapi/transaction.json
+@@ -50,6 +50,7 @@
+ # - @blockdev-snapshot: since 2.5
+ # - @blockdev-snapshot-internal-sync: since 1.7
+ # - @blockdev-snapshot-sync: since 1.1
++# - @reload-disk-snapshot-blkdev-sync: since 2.12
+ # - @drive-backup: since 1.6
+ #
+ # Since: 1.1
+@@ -63,6 +64,7 @@
+        'blockdev-snapshot': 'BlockdevSnapshot',
+        'blockdev-snapshot-internal-sync': 'BlockdevSnapshotInternal',
+        'blockdev-snapshot-sync': 'BlockdevSnapshotSync',
++       'reload-disk-snapshot-blkdev-sync': 'BlockdevSnapshotSync',
+        'drive-backup': 'DriveBackup'
+    } }
+ 
+diff --git a/util/hbitmap.c b/util/hbitmap.c
+index 58a2c93842..6b1b16fc84 100644
+--- a/util/hbitmap.c
++++ b/util/hbitmap.c
+@@ -242,6 +242,12 @@ uint64_t hbitmap_count(const HBitmap *hb)
+     return hb->count << hb->granularity;
+ }
+ 
++uint64_t hbitmap_size(const HBitmap *hb)
++{
++    return hb->size << hb->granularity;
++}
++
++
+ /* Count the number of set bits between start and end, not accounting for
+  * the granularity.  Also an example of how to use hbitmap_iter_next_word.
+  */
+-- 
+2.30.1 (Apple Git-130)
+
