@@ -1,0 +1,557 @@
+From b34bb3fc3add48378912b2212a0f5f5bb748c4b6 Mon Sep 17 00:00:00 2001
+From: wanyaoqi <wanyaoqi1995@163.com>
+Date: Sun, 15 May 2022 21:19:39 +0800
+Subject: [PATCH] libqemuio: support libqemuio on release 2.12
+
+libqemuio is library support open and read wirte qemu image,
+support encrypted disk and normal disk.
+
+Usage:
+  need add configure option ` --with-libqemuio`,
+
+Signed-off-by: wanyaoqi <wanyaoqi1995@163.com>
+---
+ src/Makefile                |   2 +
+ src/configure               |   7 +
+ src/crypto/Makefile.objs    |   2 +-
+ src/crypto/secret.c         |   4 +
+ src/include/crypto/secret.h |   1 +
+ src/include/qom/object.h    |   7 +
+ src/libqemuio.c             | 381 ++++++++++++++++++++++++++++++++++++
+ src/libqemuio.h             |  32 +++
+ src/qom/object.c            |   5 +
+ 9 files changed, 440 insertions(+), 1 deletion(-)
+ create mode 100644 src/libqemuio.c
+ create mode 100644 src/libqemuio.h
+
+diff --git a/src/Makefile b/src/Makefile
+index d71dd5be..c7e4c352 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -535,6 +535,8 @@ qemu-img$(EXESUF): qemu-img.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-o
+ qemu-nbd$(EXESUF): qemu-nbd.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(COMMON_LDADDS)
+ qemu-io$(EXESUF): qemu-io.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(COMMON_LDADDS)
+ 
++libqemuio.a: libqemuio.o $(block-obj-y) $(crypto-obj-y) $(io-obj-y) $(qom-obj-y) $(trace-obj-y) $(util-obj-y) $(COMMON_LDADDS)  $(stub-obj-y)
++
+ qemu-bridge-helper$(EXESUF): qemu-bridge-helper.o $(COMMON_LDADDS)
+ 
+ qemu-keymap$(EXESUF): qemu-keymap.o ui/input-keymap.o $(COMMON_LDADDS)
+diff --git a/src/configure b/src/configure
+index 457684a7..14eec267 100755
+--- a/src/configure
++++ b/src/configure
+@@ -1304,6 +1304,8 @@ for opt do
+   ;;
+   --enable-gcrypt) gcrypt="yes"
+   ;;
++  --with-libqemuio) libqemuio="no"
++  ;;
+   --enable-rdma) rdma="yes"
+   ;;
+   --disable-rdma) rdma="no"
+@@ -6242,6 +6244,11 @@ fi
+ if test "$have_broken_size_max" = "yes" ; then
+     echo "HAVE_BROKEN_SIZE_MAX=y" >> $config_host_mak
+ fi
++if test "$libqemuio" = "no" ; then
++    echo "DISABLE_LIBQEMUIO=n" >> $config_host_mak
++else
++    echo "DISABLE_LIBQEMUIO=y" >> $config_host_mak
++fi
+ 
+ # Work around a system header bug with some kernel/XFS header
+ # versions where they both try to define 'struct fsxattr':
+diff --git a/src/crypto/Makefile.objs b/src/crypto/Makefile.objs
+index 2b99e080..f4c236da 100644
+--- a/src/crypto/Makefile.objs
++++ b/src/crypto/Makefile.objs
+@@ -37,4 +37,4 @@ crypto-obj-y += block-luks.o
+ # Let the userspace emulators avoid linking gnutls/etc
+ crypto-aes-obj-y = aes.o
+ 
+-stub-obj-y += pbkdf-stub.o
++stub-obj-$(DISABLE_LIBQEMUIO) += pbkdf-stub.o
+diff --git a/src/crypto/secret.c b/src/crypto/secret.c
+index 388abd7d..b8b17f32 100644
+--- a/src/crypto/secret.c
++++ b/src/crypto/secret.c
+@@ -505,5 +505,9 @@ qcrypto_secret_register_types(void)
+     type_register_static(&qcrypto_secret_info);
+ }
+ 
++void object_qcrypto_secret_register_types(void)
++{
++    qcrypto_secret_register_types();
++}
+ 
+ type_init(qcrypto_secret_register_types);
+diff --git a/src/include/crypto/secret.h b/src/include/crypto/secret.h
+index edd0e132..ee5b7018 100644
+--- a/src/include/crypto/secret.h
++++ b/src/include/crypto/secret.h
+@@ -144,4 +144,5 @@ extern char *qcrypto_secret_lookup_as_utf8(const char *secretid,
+ extern char *qcrypto_secret_lookup_as_base64(const char *secretid,
+                                              Error **errp);
+ 
++void object_qcrypto_secret_register_types(void);
+ #endif /* QCRYPTO_SECRET_H */
+diff --git a/src/include/qom/object.h b/src/include/qom/object.h
+index 96ce81bc..f78264ed 100644
+--- a/src/include/qom/object.h
++++ b/src/include/qom/object.h
+@@ -1697,4 +1697,11 @@ Object *container_get(Object *root, const char *path);
+  * Returns the instance_size of the given @typename.
+  */
+ size_t object_type_get_instance_size(const char *typename);
++
++/**
++ * object_register_types:
++ *
++ * Init object type
++ */
++void object_register_types(void);
+ #endif
+diff --git a/src/libqemuio.c b/src/libqemuio.c
+new file mode 100644
+index 00000000..a2cce954
+--- /dev/null
++++ b/src/libqemuio.c
+@@ -0,0 +1,381 @@
++#include "libqemuio.h"
++
++
++struct QemuioBlk {
++    BlockBackend *blk;
++    char *filename;
++    bool readonly;
++    unsigned int ref_count;
++
++    QemuioBlk *next;
++};
++
++static QemuioBlk *qemuio_blk_list_head;
++static bool is_init;
++static QemuMutex mutex;
++
++static QemuOptsList file_opts = {
++    .name = "file",
++    .implied_opt_name = "file",
++    .head = QTAILQ_HEAD_INITIALIZER(file_opts.head),
++    .desc = {
++        /* no elements => accept any params */
++        { /* end of list */ }
++    },
++};
++
++static QemuOptsList qemu_object_opts = {
++    .name = "object",
++    .implied_opt_name = "qom-type",
++    .head = QTAILQ_HEAD_INITIALIZER(qemu_object_opts.head),
++    .desc = {
++        { }
++    },
++};
++
++static void qemuio_blk_free_item(QemuioBlk *qemuio_blk) {
++    bdrv_drain(blk_bs(qemuio_blk->blk));
++    blk_unref(qemuio_blk->blk);
++    g_free(qemuio_blk->filename);
++    g_free(qemuio_blk);
++}
++
++static QemuioBlk *qemuio_blk_new_item(char *filename, bool readonly, BlockBackend *blk) {
++    QemuioBlk *qemuio_blk = g_new0(QemuioBlk, 1);
++    if (!qemuio_blk) {
++        return NULL;
++    }
++    qemuio_blk->filename = g_strdup(filename);
++    qemuio_blk->readonly = readonly;
++    qemuio_blk->blk = blk;
++    qemuio_blk->ref_count = 1;
++    return qemuio_blk;
++}
++
++static void qemuio_blk_list_insert_head(QemuioBlk *qemuio_blk)
++{
++    qemu_mutex_lock(&mutex);
++    if (qemuio_blk_list_head != NULL) {
++        qemuio_blk->next = qemuio_blk_list_head;
++    } else {
++        qemuio_blk_list_head = qemuio_blk;
++    }
++    qemu_mutex_unlock(&mutex);
++}
++
++static QemuioBlk *qemuio_blk_list_lookup(char *filename, bool readonly)
++{
++    if (filename == NULL || qemuio_blk_list_head == NULL) {
++        return NULL;
++    }
++    qemu_mutex_lock(&mutex);
++    QemuioBlk *iter = qemuio_blk_list_head;
++    while (iter != NULL) {
++        if (g_strcmp0(filename, iter->filename) == 0 && iter->readonly == readonly) {
++            break;
++        }
++        iter = iter->next;
++    }
++    qemu_mutex_unlock(&mutex);
++    return iter;
++}
++
++static void qemuio_blk_list_remove_item(QemuioBlk *blk)
++{
++    if (blk == NULL || qemuio_blk_list_head == NULL) {
++        return;
++    }
++
++    qemu_mutex_lock(&mutex);
++    QemuioBlk *iter = qemuio_blk_list_head;
++    if (iter == blk) {
++        qemuio_blk_list_head = iter->next;
++    } else {
++        while (iter->next != NULL && iter->next != blk) {
++            iter = iter->next;
++        }
++        if (iter->next == blk) {
++            iter->next = blk->next;
++        }
++    }
++    qemu_mutex_unlock(&mutex);
++}
++
++static BlockBackend *openfile(char *name, int flags, bool writethrough, QDict *opts)
++{
++    Error *local_err = NULL;
++    BlockDriverState *bs;
++    BlockBackend *qemuio_blk = NULL;
++    char * password = NULL;
++
++    if (!opts) {
++        opts = qdict_new();
++    }
++    /* qemuio force share */
++    qdict_put_str(opts, BDRV_OPT_FORCE_SHARE, "on");
++
++    qemuio_blk = blk_new_open(name, NULL, opts, flags, &local_err);
++    if (!qemuio_blk) {
++        error_reportf_err(local_err, "can't open%s%s: ",
++                          name ? " device " : "", name ? : "");
++        return NULL;
++    }
++
++    blk_set_enable_write_cache(qemuio_blk, !writethrough);
++
++    return qemuio_blk;
++
++error:
++    blk_unref(qemuio_blk);
++
++    return NULL;
++}
++
++static int do_pwrite(BlockBackend *blk, char *buf, int64_t offset,
++                     int64_t count, int flags, int64_t *total)
++{
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    *total = blk_pwrite(blk, offset, (uint8_t *)buf, count, flags);
++    if (*total < 0) {
++        return *total;
++    }
++    return 1;
++}
++
++static int do_pread(BlockBackend *blk, char *buf, int64_t offset,
++                    int64_t count, int64_t *total)
++{
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    *total = blk_pread(blk, offset, (uint8_t *)buf, count);
++    if (*total < 0) {
++        return *total;
++    }
++    return 1;
++}
++
++void dump_buffer(const void *buffer, int64_t offset, int64_t len)
++{
++    uint64_t i;
++    int j;
++    const uint8_t *p;
++
++    for (i = 0, p = buffer; i < len; i += 16) {
++        const uint8_t *s = p;
++
++        printf("%08" PRIx64 ":  ", offset + i);
++        for (j = 0; j < 16 && i + j < len; j++, p++) {
++            printf("%02x ", *p);
++        }
++        printf(" ");
++        for (j = 0; j < 16 && i + j < len; j++, s++) {
++            if (isalnum(*s)) {
++                printf("%c", *s);
++            } else {
++                printf(".");
++            }
++        }
++        printf("\n");
++    }
++}
++
++typedef struct {
++    BlockBackend *blk;
++    int64_t offset;
++    int64_t count;
++    int64_t *total;
++    int flags;
++    int ret;
++    bool done;
++} CoWriteZeroes;
++
++static void coroutine_fn co_pwrite_zeroes_entry(void *opaque)
++{
++    CoWriteZeroes *data = opaque;
++
++    data->ret = blk_co_pwrite_zeroes(data->blk, data->offset, data->count,
++                                     data->flags);
++    data->done = true;
++    if (data->ret < 0) {
++        *data->total = data->ret;
++        return;
++    }
++
++    *data->total = data->count;
++}
++
++
++static int do_co_pwrite_zeroes(BlockBackend *blk, int64_t offset,
++                               int64_t count, int flags, int64_t *total)
++{
++    Coroutine *co;
++    CoWriteZeroes data = {
++        .blk    = blk,
++        .offset = offset,
++        .count  = count,
++        .total  = total,
++        .flags  = flags,
++        .done   = false,
++    };
++
++    if (count > INT_MAX) {
++        return -ERANGE;
++    }
++
++    co = qemu_coroutine_create(co_pwrite_zeroes_entry, &data);
++    bdrv_coroutine_enter(blk_bs(blk), co);
++    while (!data.done) {
++        aio_poll(blk_get_aio_context(blk), true);
++    }
++    if (data.ret < 0) {
++        return data.ret;
++    } else {
++        return 1;
++    }
++}
++
++int write_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset,
++                int64_t count, int flags, int64_t *total) {
++    if (qemuio_blk == NULL) {
++        return -1;
++    }
++    if (buf != NULL) {
++        return do_pwrite(qemuio_blk->blk, buf, offset, count, flags, total);
++    } else {
++        return do_co_pwrite_zeroes(qemuio_blk->blk, offset, count, flags, total);
++    }
++}
++
++int read_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int64_t *total)
++{
++    if (qemuio_blk == NULL || buf == NULL) {
++        return -EINVAL;
++    }
++    int cnt = do_pread(qemuio_blk->blk, buf, offset, count, total);
++
++#ifdef DEBUG_READ
++    dump_buffer(buf, offset, count);
++#endif
++    return cnt;
++}
++
++QemuioBlk *open_qcow2(char *filename, char* image_opts, char *secret_object, bool readonly) {
++    if (!is_init) {
++        return NULL;
++    }
++
++    int oflags = BDRV_O_UNMAP;
++    bool writethrough = true;
++    QemuioBlk *qemuio_blk = NULL;
++    QemuOpts *qopts = NULL;
++    QDict *opts = NULL;
++
++    if (!readonly) {
++        oflags |= BDRV_O_NOCACHE;
++        oflags |= BDRV_O_RDWR;
++        writethrough = false;
++    }
++
++    qopts = qemu_opts_parse_noisily(&file_opts, image_opts, false);
++    if (!qopts) {
++        return NULL;
++    }
++    opts = qemu_opts_to_qdict(qopts, NULL);
++
++    if (secret_object) {
++        qopts = qemu_opts_parse_noisily(&qemu_object_opts,
++                                        secret_object, true);
++        if (!qopts) {
++            return NULL;
++        }
++
++        if (qemu_opts_foreach(&qemu_object_opts,
++                              user_creatable_add_opts_foreach,
++                              NULL, NULL)) {
++            return NULL;
++        }
++    }
++
++    qemuio_blk = qemuio_blk_list_lookup(filename, readonly);
++    if (qemuio_blk == NULL) {
++        BlockBackend *blk = openfile(NULL, oflags, writethrough, opts);
++        if (blk) {
++            qemuio_blk = qemuio_blk_new_item(filename, readonly, blk);
++            qemuio_blk_list_insert_head(qemuio_blk);
++        }
++    } else {
++        qemuio_blk->ref_count++;
++    }
++    return qemuio_blk;
++}
++
++void close_qcow2(QemuioBlk *qemuio_blk, const char *sec_id) {
++    Error *local_error = NULL;
++    if (qemuio_blk != NULL && atomic_dec_fetch(&qemuio_blk->ref_count) == 0) {
++        qemuio_blk_list_remove_item(qemuio_blk);
++        qemuio_blk_free_item(qemuio_blk);
++
++        if (sec_id != NULL)
++            user_creatable_del(sec_id, &local_error);
++        if (local_error != NULL)
++            error_report_err(local_error);
++    }
++}
++
++int64_t qcow2_get_length(QemuioBlk *qemuio_blk) {
++    if (qemuio_blk == NULL) {
++        return -1;
++    }
++    BlockDriverState *blk = blk_bs(qemuio_blk->blk);
++    if (blk == NULL) {
++        return -1;
++    }
++    int64_t len = bdrv_getlength(blk);
++    return len;
++}
++
++static const TypeInfo container_info = {
++    .name          = "container",
++    .instance_size = sizeof(Object),
++    .parent        = TYPE_OBJECT,
++};
++
++static void container_register_types(void)
++{
++    type_register_static(&container_info);
++}
++
++static void uc_interface_register_types(void)
++{
++    static const TypeInfo uc_interface_info = {
++        .name          = TYPE_USER_CREATABLE,
++        .parent        = TYPE_INTERFACE,
++        .class_size = sizeof(UserCreatableClass),
++    };
++
++    type_register_static(&uc_interface_info);
++}
++
++void qemuio_init(void) {
++    if (!is_init) {
++        object_register_types();
++        uc_interface_register_types();
++        container_register_types();
++        object_qcrypto_secret_register_types();
++        bdrv_init();
++
++        Error *local_error = NULL;
++        if (qemu_init_main_loop(&local_error)) {
++            error_report_err(local_error);
++            exit(1);
++        }
++        is_init = true;
++        qemu_mutex_init(&mutex);
++        qemu_add_opts(&qemu_object_opts);
++    }
++}
+diff --git a/src/libqemuio.h b/src/libqemuio.h
+new file mode 100644
+index 00000000..686ad413
+--- /dev/null
++++ b/src/libqemuio.h
+@@ -0,0 +1,32 @@
++#ifndef _LIB_QEMU_IO_H_
++#define _LIB_QEMU_IO_H_
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu-io.h"
++#include "qemu/error-report.h"
++#include "qemu/main-loop.h"
++#include "qemu/option.h"
++#include "qemu/config-file.h"
++#include "qemu/readline.h"
++#include "qemu/log.h"
++#include "qapi/qmp/qstring.h"
++#include "qom/object_interfaces.h"
++#include "qom/object.h"
++#include "crypto/secret.h"
++#include "sysemu/block-backend.h"
++#include <glib.h>
++
++typedef struct QemuioBlk QemuioBlk;
++
++QemuioBlk *open_qcow2(char *filename, char* image_opts, char *secret_object, bool readonly);
++
++int write_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int flags, int64_t *total);
++int read_qcow2(QemuioBlk *qemuio_blk, void *buf, int64_t offset, int64_t count, int64_t *total);
++void close_qcow2(QemuioBlk *qemuio_blk, const char *sec_id);
++
++int64_t qcow2_get_length(QemuioBlk *qemuio_blk);
++void qemuio_init(void);
++void dump_buffer(const void *buffer, int64_t offset, int64_t len);
++
++#endif
+\ No newline at end of file
+diff --git a/src/qom/object.c b/src/qom/object.c
+index 46779518..32d7e32d 100644
+--- a/src/qom/object.c
++++ b/src/qom/object.c
+@@ -2386,4 +2386,9 @@ static void register_types(void)
+     type_register_internal(&object_info);
+ }
+ 
++void object_register_types(void)
++{
++    register_types();
++}
++
+ type_init(register_types)
+-- 
+2.20.1 (Apple Git-117)
+
