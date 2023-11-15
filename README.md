@@ -10,13 +10,13 @@ $ wget https://download.qemu.org/qemu-4.2.0.tar.xz
 $ tar -xvzf qemu-4.2.0.tar.xz
 
 # 下载4.2 patch 文件
-$ wget https://raw.githubusercontent.com/yunionio/qemu/stable-4.2/0001-patch-for-4.2.patch
+$ wget https://raw.githubusercontent.com/yunionio/qemu/stable-4.2/0002-patch-for-4.2.patch
 
 # 进入qemu目录
 $ cd qemu-4.2.0/ 
 
 # 打上补丁文件
-$ git apply ../0001-patch-for-4.2.patch
+$ git apply ../0002-patch-for-4.2.patch
 
 
 # 使用 docker 编译 libqemuio.a
