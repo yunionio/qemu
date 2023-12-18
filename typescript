@@ -1,53 +1,0 @@
-Script started on Mon Dec 18 11:29:50 2023
-[1m[7m%[27m[1m[0m                                                                                             ]2;rex@Mac-mini: ~/git/qemu]1;~/git/qemu[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?1h=[?2004h[?25l[A[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?12l[?25hscript[32ms[32mc[32mr[32mi[32mp[32mt[39m[32mt[32ms[39m[4m[32ms[4m[32mc[4m[32mr[4m[32mi[4m[32mp[4m[32mt[4m[32ms[24m[39m[?1l>[?2004l
-]2;scripts]1;scripts[1m[7m%[27m[1m[0m                                                                                             ]2;rex@Mac-mini: ~/git/qemu/scripts]1;../qemu/scripts[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu/scripts[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?1h=[?2004hl[90ms scripts/[39m[10D[32ml[39m[32ml[32ml[39m[39m [39m [39m [39m [39m [39m [39m [39m [39m [9D[?1l>[?2004l
-]2;exa -h -b -l --git --icons --no-user]1;ll[1m[7m%[27m[1m[0m                                                                                             ]2;rex@Mac-mini: ~/git/qemu/scripts]1;../qemu/scripts[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu/scripts[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?1h=[?2004hl[90ml[39m[32ml[39m[32ml[32ms[39m[90m scripts/[39m[9D[39m [39m [39m [39m [39m [39m [39m [39m [39m [9D[?1l>[?2004l
-]2;/usr/local/opt/coreutils/libexec/gnubin/ls --color=tty --time-style=long-iso]1;ls[0m[01;32mcherry_pick_pull.sh[0m
-[1m[7m%[27m[1m[0m                                                                                             ]2;rex@Mac-mini: ~/git/qemu/scripts]1;../qemu/scripts[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu/scripts[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?1h=[?2004hc[90mp ../hack/cherry_pick_pull.sh ~/git/qemu/scripts[39m[48D[32mc[39m[32mc[32md[39m[90m [90ms[90mc[90mr[90mi[90mp[90mt[90ms[39m[39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [47D[32mc[32md[32m [39m[32mc[32md[39m[39m [39m.[90m.[39m[39m [39m [39m [39m [39m [4m.[24m[4m.[39m[4m.[24m[?1l>[?2004l
-]2;cd ..]1;cd[1m[7m%[27m[1m[0m                                                                                             ]2;rex@Mac-mini: ~/git/qemu]1;~/git/qemu[0m[27m[24m[J[0m[30m[42m[49m[39m
-[A[0m[40m[37m [0m[37m[40m[40m[37m [0m[37m[40m[40m[0m[37m[40m[40m[33m  rex[0m[33m[40m[40m[33m [0m[33m[40m[44m[30m[0m[30m[44m[44m[30m   ~/git/qemu[0m[30m[44m[44m[30m [0m[30m[44m[42m[34m[0m[34m[42m[42m[30m   [0m[30m[42m[42m[30m hotfix/rex-fix-typo[0m[30m[42m[42m[30m[0m[30m[42m[42m[30m  [0m[30m[42m[42m[30m [0m[30m[42m[49m[32m[0m[32m[49m[39m [0m[49m[39m
-[01;32m➜ [0m[49m[0m[49m[39m[K[?1h=[?2004h.[90m.[39m[32m.[39m[32m.[32m/[39m[90mscripts/cherry_pick_pull.sh upstream/release/3.10 56[39m[52D[4m[32m.[4m[32m/[24m[39m[4m[32m.[4m[32m/[4m[32ms[24m[39m[39m[4m.[39m[4m/[39m[4ms[24m[39mc[39mr[39mi[39mp[39mt[39ms[39m/[39mc[39mh[39me[39mr[39mr[39my[39m_[39mp[39mi[39mc[39mk[39m_[39mp[39mu[39ml[39ml[39m.[39ms[39mh[39m [39mu[39mp[39ms[39mt[39mr[39me[39ma[39mm[39m/[39mr[39me[39ml[39me[39ma[39ms[39me[39m/[39m3[39m.[39m1[39m0[39m [39m5[39m6[54D[24m[32m.[24m[32m/[24m[32ms[32mc[32mr[32mi[32mp[32mt[32ms[32m/[32mc[32mh[32me[32mr[32mr[32my[32m_[32mp[32mi[32mc[32mk[32m_[32mp[32mu[32ml[32ml[32m.[32ms[32mh[39m[25C[90m5[90m6[39m[90m1[90m0[90m [90m3[90m.[39m[39m3[39m.[39m1[39m0[39m [39m5[39m6[1C 56   56  [8D 56        [11D[3C  [90mr[90melease/3.10 56[39m[15D[39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [39m [14Dstable-4.2 [1C 6 [?1l>[?2004l
-]2;./scripts/cherry_pick_pull.sh upstream/stable-4.2 6]1;./scripts/cherry_pick_pull.sh+++ Updating remotes...
-Fetching upstream
-From https://github.com/yunionio/qemu
- * [new branch]      main        -> upstream/main
- * [new branch]      stable-2.12 -> upstream/stable-2.12
- * [new branch]      stable-4.2  -> upstream/stable-4.2
-Fetching origin
-+++ Creating local branch automated-cherry-pick-of-#6-upstream-stable-4.2-1702870278
-branch 'automated-cherry-pick-of-#6-upstream-stable-4.2-1702870278' set up to track 'upstream/stable-4.2' by rebasing.
-Switched to a new branch 'automated-cherry-pick-of-#6-upstream-stable-4.2-1702870278'
-+++ Downloading patch to /tmp/6.patch (in case you need to do this again)
-
-+++ About to attempt cherry pick of PR. To reattempt:
-  $ git am -3 /tmp/6.patch
-
-Applying: fix(typo): 修复404链接、解压命令、架构兼容
-Using index info to reconstruct a base tree...
-M	README.md
-Falling back to patching base and 3-way merge...
-Auto-merging README.md
-CONFLICT (content): Merge conflict in README.md
-error: Failed to merge in the changes.
-Patch failed at 0001 fix(typo): 修复404链接、解压命令、架构兼容
-[33mhint: Use 'git am --show-current-patch=diff' to see the failed patch[m
-When you have resolved this problem, run "git am --continue".
-If you prefer to skip this patch, run "git am --skip" instead.
-To restore the original branch and stop patching, run "git am --abort".
-
-+++ Conflicts detected:
-
-UU README.md
-
-+++ Please resolve the conflicts in another window (and remember to 'git add / git am --continue')
-+++ Proceed (anything but 'y' aborts the cherry-pick)? [y/n] 
