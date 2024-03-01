@@ -1,13 +1,13 @@
-# qemu
+# Cloudpods QEMU及libqemuio.a编译过程
 
-## 编译libqemuio.a
+**注意：以下流程适合CentOS，其他发行版请酌情变更安装包和命令**
 
 ``` bash
 # 下载官方qemu压缩包
 $ wget https://download.qemu.org/qemu-4.2.0.tar.xz
 
 # 解压qemu压缩包
-$ tar Jxvf qemu-4.2.0.tar.xz
+$ tar jxvf qemu-4.2.0.tar.xz
 
 # 下载4.2 patch 文件
 $ wget https://raw.githubusercontent.com/yunionio/qemu/main/0002-patch-for-4.2.patch
@@ -16,17 +16,17 @@ $ wget https://raw.githubusercontent.com/yunionio/qemu/main/0002-patch-for-4.2.p
 $ cd qemu-4.2.0/ 
 
 # 打上补丁文件
-$ git apply ../0002-patch-for-4.2.patch
+$ patch -p1 -i ../0002-patch-for-4.2.patch
 
+# 安装基础包
+yum install -y gcc make bison
 
-# 使用 docker 编译 libqemuio.a
-$ docker run --network host -v $(pwd):/root/qemu -it debian:10
-root@ampere:/$ sed -i 's|http://deb.debian.org|http://mirrors.aliyun.com|g' /etc/apt/sources.list
-root@ampere:/$ apt-get update 
-root@ampere:/$ apt-get install -y gcc make git vim python pkg-config flex bison libpixman-1-dev libudev-dev libaio-dev libcurl4-openssl-dev zlib1g-dev libglib2.0-dev libusb-1.0-0-dev libusbredirparser-dev libusbredirhost-dev libcapstone-dev libcephfs-dev librbd-dev librados-dev libspice-server-dev libspice-protocol-dev libfdt-dev
-root@ampere:/$ cd /root/qemu && make clean
-root@ampere:~/qemu$ ./configure --target-list=$(uname -m)-softmmu --enable-libusb --extra-ldflags=-lrt --enable-spice --enable-rbd
-root@ampere:~/qemu$ make libqemuio.a
+# 配置, 根据提示安装对应的包，部分包需要自行编译
+./configure --prefix=/usr/local/qemu-4.2.0 --target-list=$(uname -m)-softmmu --enable-libusb --extra-ldflags=-lrt --enable-spice --enable-rbd --enable-gnutls --disable-libiscsi --disable-smartcard --disable-auth-pam --disable-virglrenderer
 
-# 然后退出 docker，libqemuio.a 已经编译在 qemu-4.2.0 目录里面了
+# 编译并安装所有二进制到 /usr/local/qemu-4.2.0
+make && make install
+
+# 编译libqemuio.a
+make libqemuio.a
 ```
