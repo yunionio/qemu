@@ -30,3 +30,17 @@ make && make install
 # 编译libqemuio.a
 make libqemuio.a
 ```
+
+## FAQ:
+
+Q1. 为什么使用本地盘时 QEMU 执行特定操作时会报如下错误：Could not open backing file：Failed to get shared "write" lock"
+
+A1: 这是因为编译 qemu 时，编译机内核头文件中定义了 F_OFD_SETLK, 从而启用了本地文件锁，使用本地盘的虚拟机在做快照或热迁移时会触发这个报错。为了避免这个报错，可以注释内核头文件对 F_OFD_SETLK 的宏申明，再重新编译qemu。
+
+```
+$ grep -r F_OFD_SETLK  /usr/include/
+/usr/include/asm-generic/fcntl.h:#define F_OFD_SETLK    37
+/usr/include/asm-generic/fcntl.h:#define F_OFD_SETLKW   38
+/usr/include/bits/fcntl-linux.h:# define F_OFD_SETLK    37
+/usr/include/bits/fcntl-linux.h:# define F_OFD_SETLKW   38
+```
